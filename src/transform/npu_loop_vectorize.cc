@@ -737,12 +737,6 @@ private:
   Stmt VectorizeSingleStatement(const ForNode *op) {
     const auto *store = op->body.as<BufferStoreNode>();
 
-    // Store indices must be variables or constants only.
-    for (const auto &idx : store->indices) {
-      if (!idx.as<VarNode>() && !IsScalar(idx))
-        return StmtMutator::VisitStmt_(op);
-    }
-
     Array<Stmt> stmts;
     std::vector<BufferAccessInfo> tmp_bufs;
 
@@ -833,6 +827,12 @@ private:
 
   bool IsScalar(const PrimExpr &expr) {
     return expr.as<IntImmNode>() || expr.as<FloatImmNode>();
+  }
+
+  inline bool IsAlignedTo32B(int64_t size, const tvm::DataType& dtype) {
+    int64_t bytes_per_elem = dtype.bits() / 8;
+    int64_t total_bytes = size * bytes_per_elem;
+    return total_bytes % 32 == 0;
   }
 
   // return a integer if the input is able to be converted, else return null
@@ -1046,16 +1046,6 @@ private:
         // something wrong happened
         if (!used_analyzer->CanProveEqual(size_expr, 1))
           return false;
-      } else {
-        // lower dimensions must participate in the operation completely;
-        // otherwise, the current dimension cannot be vectorized. The first
-        // condition: The size is equal to the size of the corresponding
-        // dimension.
-        if (!used_analyzer->CanProveEqual(size_expr, buffer->shape[i]))
-          return false;
-        // The second condition: offset equals zero
-        if (!used_analyzer->CanProveEqual(offsets[i], 0))
-          return false;
       }
     }
 
@@ -1063,16 +1053,17 @@ private:
   }
 
   std::optional<PrimExpr>
-  AnalyzeNewOffset(const std::vector<PrimExpr> &offsets,
-                   const VarNode *loop_var, int loop_var_dim, int start,
-                   arith::Analyzer *analyzer = nullptr) {
+  TryBuildVectorizedRegion(RegionInfo info, const VarNode *loop_var,
+                           int loop_var_dim, int start, int loop_count,
+                           arith::Analyzer *analyzer = nullptr) {
     arith::Analyzer local_analyzer;
     arith::Analyzer *used_analyzer = analyzer ? analyzer : &local_analyzer;
 
     // check the expression about loop var to ensure the continuity of mem
     // access
-    Array<PrimExpr> res = arith::DetectLinearEquation(offsets[loop_var_dim],
-                                                      {GetRef<Var>(loop_var)});
+    Array<PrimExpr> res = arith::DetectLinearEquation(
+        info->offsets[loop_var_dim], {GetRef<Var>(loop_var)}
+    );
     if (res.empty() || !used_analyzer->CanProveEqual(res[0], 1)) {
       // Not a linear expression or the coefficient of the first term is not 1
       // -> disable to vectorize
@@ -1080,8 +1071,31 @@ private:
     }
 
     PrimExpr new_offset = res[1] + make_const(res[1].dtype(), start);
+    // If it is the last axis, it must meet specific alignment requirements
+    int d = info->offsets.size();
+    if (loop_var_dim == d - 1) {
+      auto new_offset_value = TryGetConstIntValue(new_offset, used_analyzer);
+      if (!new_offset_value ||
+          !IsAlignedTo32B(*new_offset_value, info->buffer->dtype)) {
+        // Offset of the last axis must be aligned to 32B
+        // Specifically, non-constant value cannot guarantee alignment
+        return std::nullopt;
+      }
+      auto last_size = info->sizes[d - 1];
+      if (loop_count != last_size &&
+          !IsAlignedTo32B(last_size, info->buffer->dtype)) {
+        // Vectorize the last axis entirely
+        // Or the end address must be aligned to 32B
+        return std::nullopt;
+      }
+    }
 
-    return used_analyzer->Simplify(new_offset);
+    // Build and return vectorized region
+    info->offsets[loop_var_dim] = *new_offset;
+    info->sizes[loop_var_dim] = loop_count;
+
+    return BuildRegionCall(info->buffer, info->offsets, info->regionId,
+                           info->sizes);
   }
 
   std::optional<PrimExpr>
@@ -1114,18 +1128,9 @@ private:
       return std::nullopt;
     }
 
-    // Step 4: try to analyze the offset after vectorization
-    auto new_offset = AnalyzeNewOffset(info->offsets, loop_var, loop_var_dim,
-                                       start, used_analyzer);
-    if (!new_offset)
-      return std::nullopt;
-
-    // Step 5: build and return vectorized region
-    info->offsets[loop_var_dim] = *new_offset;
-    info->sizes[loop_var_dim] = loop_count;
-
-    return BuildRegionCall(info->buffer, info->offsets, info->regionId,
-                           info->sizes);
+    // Step 4: try to analyze the offset and build vectorized region
+    return TryBuildVectorizedRegion(info, loop_var, loop_var_dim, start,
+                                    loop_count, used_analyzer);
   }
 
   Stmt VectorizeForBody(const ForNode *forNode, const Stmt &stmt) {
