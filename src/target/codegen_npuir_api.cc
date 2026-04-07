@@ -1447,8 +1447,12 @@ void CodeGenTileLangNPUIRAPI::VAtomicAddCodegen(const CallNode *op) {
   /// after:
   ///   hivm.hir.store ins(src) outs(dst) atomic = <add>
   tvm::tl::NpuirAtomicAdd npuirop(op->args, this->vmap);
-  Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  // Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
+  mlir::Value src = GenRankReducedSubviewFromRegion(
+      npuirop.src, npuirop.src_range);
+  // Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  mlir::Value dst = GenRankReducedSubviewFromRegion(
+      npuirop.dst, npuirop.dst_range);
 
   // create StoreOp
   auto newStoreOp = builder.create<hivm::StoreOp>(builder.getUnknownLoc(),
